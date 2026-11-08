@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1b5e3b" />
+  <title>Seerat Live Attendance</title>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #102a1f; background: #0b1a12; }
+    body { margin: 0; min-height: 100dvh; display: flex; flex-direction: column; }
+    header, footer, .panel { padding: 12px 16px; background: #f3f6f2; color: #102a1f; }
+    header h1 { margin: 0; font-size: 1.1rem; }
+    .hint { margin: 6px 0 0; font-size: 0.8rem; color: #456; line-height: 1.3; }
+    .stage { position: relative; flex: 1; background: #000; min-height: 55vh; }
+    video, canvas.overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    canvas.overlay { display: none; }
+    .frame {
+      position: absolute; inset: 18% 12%; border: 2px solid #7dffa8; border-radius: 16px;
+      box-shadow: 0 0 0 9999px #0006; pointer-events: none;
+    }
+    label { display: block; font-size: 0.8rem; margin-bottom: 4px; }
+    select, button { width: 100%; font-size: 1rem; padding: 12px; border-radius: 10px; box-sizing: border-box; }
+    select { margin-bottom: 8px; border: 1px solid #c5d0c8; }
+    button { border: 0; font-weight: 700; background: #1b5e3b; color: #fff; }
+    button.secondary { background: #44554c; margin-top: 8px; }
+    button:disabled { opacity: 0.5; }
+    #status {
+      margin-top: 10px; padding: 12px; border-radius: 10px; background: #e8f0eb;
+      white-space: pre-wrap; min-height: 3.2em;
+    }
+    #status.ok { background: #d8f5e3; }
+    #status.dup { background: #fff3cd; }
+    #status.err { background: #fde2e1; }
+    #status.scan { background: #dceeff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Seerat — Live scan</h1>
+    <p class="hint">
+      Ideal flow: open camera → show QR in the green frame → phone vibrates → camera closes → attendance saved.
+      Use <b>Chrome</b> on Android. Needs HTTPS (or localhost).
+    </p>
+  </header>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="process" class="overlay"></canvas>
+    <div class="frame" id="frame" hidden></div>
+  </div>
+
+  <div class="panel">
+    <label for="session">Session</label>
+    <select id="session">
+      <option value="1">Session 1</option>
+      <option value="2">Session 2</option>
+      <option value="3">Session 3</option>
+      <option value="4">Session 4</option>
+      <option value="5">Session 5</option>
+      <option value="6">Session 6</option>
+      <option value="7">Session 7</option>
+      <option value="8">Session 8</option>
+    </select>
+    <button type="button" id="btnStart">Open camera &amp; scan</button>
+    <button type="button" id="btnStop" class="secondary" disabled>Cancel camera</button>
+    <div id="status">Ready.</div>
+  </div>
+
+  <script>
+    /**
+     * Paste your Apps Script Web App /exec URL here for Google Sheet write.
+     * Leave empty to use local test server: POST /api/attend
+     */
+    const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzx-zfzAQFCjcqoInvXrGUOPHY-KhFUA2V3yIh5GjWRT6CaepveYTjm6ZOB4AZJiSYVJQ/exec';
+
+    const video = document.getElementById('video');
+    const processCanvas = document.getElementById('process');
+    const processCtx = processCanvas.getContext('2d', { willReadFrequently: true });
+    const frame = document.getElementById('frame');
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const statusEl = document.getElementById('status');
+
+    let stream = null;
+    let looping = false;
+    let handling = false;
+    let lastPayload = '';
+    let lastAt = 0;
+
+    function setStatus(msg, cls) {
+      statusEl.textContent = msg;
+      statusEl.className = cls || '';
+    }
+
+    function vibrateOk() {
+      try {
+        if (navigator.vibrate) navigator.vibrate([80, 40, 120]);
+      } catch (e) { /* ignore */ }
+    }
+
+    function vibrateDup() {
+      try {
+        if (navigator.vibrate) navigator.vibrate([30, 40, 30, 40, 30]);
+      } catch (e) { /* ignore */ }
+    }
+
+    async function stopCamera() {
+      looping = false;
+      if (stream) {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        stream = null;
+      }
+      video.srcObject = null;
+      frame.hidden = true;
+      btnStop.disabled = true;
+      btnStart.disabled = false;
+    }
+
+    async function record(payloadText) {
+      const session = document.getElementById('session').value;
+      const body = JSON.stringify({ session: session, payload: payloadText });
+
+      if (APPS_SCRIPT_URL) {
+        // text/plain avoids CORS preflight to Apps Script
+        const res = await fetch(APPS_SCRIPT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: body,
+        });
+        const data = await res.json();
+        return data;
+      }
+
+      const res = await fetch('/api/attend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+      });
+      return res.json();
+    }
+
+    async function onDetected(text) {
+      if (handling) return;
+      const now = Date.now();
+      if (text === lastPayload && now - lastAt < 5000) return;
+
+      try {
+        JSON.parse(text);
+      } catch (e) {
+        setStatus('QR is not a participant JSON code', 'err');
+        return;
+      }
+
+      handling = true;
+      lastPayload = text;
+      lastAt = now;
+
+      // Ideal UX: vibrate immediately, close camera, then save
+      vibrateOk();
+      await stopCamera();
+      setStatus('QR detected. Saving attendance…', 'scan');
+
+      try {
+        const result = await record(text);
+        if (!result || result.ok === false) {
+          setStatus((result && result.message) || 'Save failed', 'err');
+          handling = false;
+          return;
+        }
+        if (result.duplicate) {
+          vibrateDup();
+          setStatus(result.message, 'dup');
+        } else {
+          setStatus(result.message + '\nCamera closed — recorded.', 'ok');
+        }
+      } catch (e) {
+        setStatus('Detected QR but save failed:\n' + e + '\n\nIf using Google Sheet, set APPS_SCRIPT_URL in this file.', 'err');
+      }
+      handling = false;
+    }
+
+    function decodeFrame() {
+      if (!looping || !stream || handling) return;
+      if (video.readyState < 2) {
+        requestAnimationFrame(decodeFrame);
+        return;
+      }
+
+      const maxW = 720;
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      const scale = Math.min(1, maxW / vw);
+      const w = Math.round(vw * scale);
+      const h = Math.round(vh * scale);
+      processCanvas.width = w;
+      processCanvas.height = h;
+      processCtx.drawImage(video, 0, 0, w, h);
+
+      // Prefer center region (green frame area ~ middle)
+      const cw = Math.round(w * 0.76);
+      const ch = Math.round(h * 0.64);
+      const cx = Math.round((w - cw) / 2);
+      const cy = Math.round((h - ch) / 2);
+      const crop = processCtx.getImageData(cx, cy, cw, ch);
+      const code = jsQR(crop.data, crop.width, crop.height, { inversionAttempts: 'attemptBoth' });
+      if (code && code.data) {
+        onDetected(code.data);
+        return;
+      }
+
+      requestAnimationFrame(decodeFrame);
+    }
+
+    async function startCamera() {
+      if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+        setStatus(
+          'Live camera needs HTTPS (or localhost).\n' +
+            'Open this page via HTTPS host, or test on desktop localhost.',
+          'err'
+        );
+        return;
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setStatus('Camera API not available in this browser. Use Chrome.', 'err');
+        return;
+      }
+
+      handling = false;
+      setStatus('Opening camera…', 'scan');
+      btnStart.disabled = true;
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+        });
+        video.srcObject = stream;
+        await video.play();
+        frame.hidden = false;
+        looping = true;
+        btnStop.disabled = false;
+        setStatus('Point QR inside the green frame…', 'scan');
+        requestAnimationFrame(decodeFrame);
+      } catch (e) {
+        btnStart.disabled = false;
+        setStatus('Could not open camera:\n' + e + '\n\nAllow Camera for this site in Chrome settings.', 'err');
+      }
+    }
+
+    btnStart.onclick = startCamera;
+    btnStop.onclick = async function () {
+      await stopCamera();
+      setStatus('Camera cancelled.');
+    };
+  </script>
+</body>
+</html>
